@@ -11,23 +11,32 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install customtkinter pyinstaller
-
       - name: Build EXE
         run: pyinstaller --onedir --windowed --name "Task Tracker" task_tracker.py --noconfirm --clean
-
+      - name: Zip artifact
+        run: Compress-Archive -Path "dist/Task Tracker/*" -DestinationPath "TaskTracker-Windows.zip"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: TaskTracker-Windows
           path: dist/Task Tracker/
           retention-days: 30
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Task Tracker v1.0.${{ github.run_number }}
+          files: TaskTracker-Windows.zip
+          body: |
+            Windows executable for Task Tracker.
+            Download and extract TaskTracker-Windows.zip to run.
