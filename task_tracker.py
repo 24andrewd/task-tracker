@@ -5,6 +5,32 @@ from datetime import date, datetime
 from pathlib import Path
 import uuid
 
+# -- Palette (light "paper notepad" theme) --------------------------------------
+PAPER       = "#ffffff"   # page background
+INK         = "#23262e"   # main text / title
+RULE_DARK   = "#23262e"   # bold rule under the title
+RULE_LIGHT  = "#e4e5ea"   # faint ruled lines under each row
+LABEL_GRAY  = "#9298a3"   # small-caps section labels ("TOP PRIORITIES")
+BOX_BORDER  = "#b9bdc6"   # checkbox outline
+CHECK_FILL  = "#2f3440"   # checked checkbox fill
+DONE_TEXT   = "#aab0b9"   # completed item text
+DATE_FILL   = "#eef0f3"   # date field background
+HOVER       = "#f3f4f6"   # subtle hover
+DELETE_GRAY = "#c7cbd2"   # delete "x"
+SUB_TEXT    = "#5b616c"   # subtask text
+ACCENT      = "#2563eb"   # add-subtask "+"
+
+# Due-date colors
+DUE_OVERDUE = "#dc2626"
+DUE_TODAY   = "#d97706"
+DUE_SOON    = "#2563eb"
+DUE_LATER   = "#9298a3"
+
+# Minimum ruled lines drawn per panel for the printed-notepad look
+MIN_LINES = {"todo": 18, "priority": 7, "appointment": 7}
+
+CATEGORIES = ["todo", "priority", "appointment"]
+
 # -- Persistence ----------------------------------------------------------------
 def get_data_path():
     if os.name == "nt":
@@ -20,10 +46,13 @@ def load_tasks():
     try:
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
-            # migrate old tasks that lack subtasks/expanded fields
             for t in data:
+                cat = t.get("category", "todo")
+                t["category"] = cat if cat in CATEGORIES else "todo"
+                t.setdefault("due", "")
                 t.setdefault("subtasks", [])
                 t.setdefault("expanded", True)
+                t.setdefault("created", "")
             return data
     except Exception:
         return []
@@ -32,261 +61,395 @@ def save_tasks(tasks):
     with open(DATA_FILE, "w") as f:
         json.dump(tasks, f, indent=2)
 
-# -- Helpers --------------------------------------------------------------------
-def today_str():
-    return date.today().isoformat()
+# -- Date helpers ---------------------------------------------------------------
+def parse_due(s):
+    """Return ISO date string, '' for blank, or None if unparseable."""
+    s = s.strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m/%d"):
+        try:
+            d = datetime.strptime(s, fmt).date()
+            if fmt == "%m/%d":
+                d = d.replace(year=date.today().year)
+            return d.isoformat()
+        except ValueError:
+            continue
+    return None
 
 def due_priority(due):
     if not due:
         return 99999
-    t = today_str()
-    if due < t:
-        return -1
     return (date.fromisoformat(due) - date.today()).days
 
 def fmt_due(due):
-    if not due:
-        return "", "#9ca3af"
+    """Short label + color for a due date."""
     d = date.fromisoformat(due)
-    label = d.strftime("%b %d, %Y")
+    label = d.strftime("%b %-d") if os.name != "nt" else d.strftime("%b %#d")
     delta = (d - date.today()).days
     if delta < 0:
-        return f"\U0001f4c5  {label}  \u26a0 Overdue by {-delta}d", "#f87171"
-    elif delta == 0:
-        return f"\U0001f4c5  {label}  \u25cf Due Today", "#fbbf24"
-    elif delta <= 3:
-        return f"\U0001f4c5  {label}  \u25cb In {delta}d", "#60a5fa"
-    else:
-        return f"\U0001f4c5  {label}", "#9ca3af"
+        return f"{label} ⚠", DUE_OVERDUE
+    if delta == 0:
+        return "Today", DUE_TODAY
+    if delta <= 3:
+        return label, DUE_SOON
+    return label, DUE_LATER
 
-def accent_color(due, done):
-    if done or not due:
-        return None
-    t = today_str()
-    if due < t:        return "#ef4444"
-    elif due == t:     return "#f59e0b"
-    delta = (date.fromisoformat(due) - date.today()).days
-    if delta <= 3:     return "#4f8ef7"
-    return None
+def item_font(size=15, overstrike=False):
+    # Clean printed look — uses CustomTkinter's default font family
+    return ctk.CTkFont(size=size, overstrike=overstrike)
 
 # -- App ------------------------------------------------------------------------
 class TaskTrackerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        ctk.set_appearance_mode("dark")
+        ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
-        self.title("Task Tracker")
-        self.geometry("740x740")
-        self.minsize(580, 500)
-        self.configure(fg_color="#0f1117")
+        self.title("To-Do List")
+        self.geometry("900x820")
+        self.minsize(720, 580)
+        self.configure(fg_color=PAPER)
 
         self.tasks = load_tasks()
+        self.frames = {}          # category -> scrollable frame
+        self.entries = {}         # category -> add (name) entry
+        self.date_entries = {}    # category -> add (due) entry
         self._subtask_open_id = None
-        self._build_ui()
-        self._render()
 
+        self._build_ui()
+        self._render_all()
+
+    # -- Layout -----------------------------------------------------------------
     def _build_ui(self):
         hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.pack(fill="x", padx=28, pady=(24, 0))
-        ctk.CTkLabel(hdr, text="\U0001f4cb  Task Tracker",
-                     font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color="#ffffff").pack(side="left")
+        hdr.pack(fill="x", padx=36, pady=(26, 0))
+        ctk.CTkLabel(hdr, text="TO-DO LIST",
+                     font=ctk.CTkFont(size=30, weight="bold"),
+                     text_color=INK).pack(side="left")
 
-        form = ctk.CTkFrame(self, fg_color="#1a1d27", corner_radius=12,
-                            border_width=1, border_color="#2a2d3a")
-        form.pack(fill="x", padx=28, pady=16)
+        date_box = ctk.CTkFrame(hdr, fg_color="transparent")
+        date_box.pack(side="right")
+        ctk.CTkLabel(date_box, text="DATE",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=LABEL_GRAY).pack(side="left", padx=(0, 8), pady=(6, 0))
+        self.date_entry = ctk.CTkEntry(date_box, width=120, height=30,
+                                       fg_color=DATE_FILL, border_width=0,
+                                       text_color=INK, justify="center",
+                                       font=ctk.CTkFont(size=14))
+        self.date_entry.insert(0, date.today().strftime("%m/%d/%Y"))
+        self.date_entry.pack(side="left", pady=(4, 0))
 
-        ctk.CTkLabel(form, text="TASK", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#6b7280").grid(row=0, column=0, sticky="w",
-                                               padx=(16,4), pady=(12,2))
-        ctk.CTkLabel(form, text="DUE DATE", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#6b7280").grid(row=0, column=1, sticky="w",
-                                               padx=(8,4), pady=(12,2))
+        ctk.CTkFrame(self, height=2, fg_color=RULE_DARK).pack(
+            fill="x", padx=36, pady=(10, 0))
 
-        self.task_entry = ctk.CTkEntry(form, placeholder_text="What needs to get done?",
-                                       fg_color="#0f1117", border_color="#2a2d3a",
-                                       text_color="#e8eaf0", height=38, width=360)
-        self.task_entry.grid(row=1, column=0, padx=(16,4), pady=(0,14))
-        self.task_entry.bind("<Return>", lambda e: self._add_task())
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=36, pady=(8, 24))
+        body.columnconfigure(0, weight=3, uniform="col")
+        body.columnconfigure(1, weight=2, uniform="col")
+        body.rowconfigure(0, weight=1)
 
-        self.date_entry = ctk.CTkEntry(form, placeholder_text="YYYY-MM-DD",
-                                       fg_color="#0f1117", border_color="#2a2d3a",
-                                       text_color="#e8eaf0", height=38, width=148)
-        self.date_entry.grid(row=1, column=1, padx=(8,8), pady=(0,14))
-        self.date_entry.insert(0, today_str())
-        self.date_entry.bind("<Return>", lambda e: self._add_task())
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 22))
+        self._panel(left, "todo", title=None, expand=True)
 
-        add_btn = ctk.CTkButton(form, text="+ Add Task", width=110, height=38,
-                                fg_color="#4f8ef7", hover_color="#3d7de8",
-                                font=ctk.CTkFont(size=13, weight="bold"),
-                                command=self._add_task)
-        add_btn.grid(row=1, column=2, padx=(4,16), pady=(0,14))
-        form.columnconfigure(0, weight=1)
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
 
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent",
-                                              scrollbar_button_color="#2a2d3a",
-                                              scrollbar_button_hover_color="#3a3d4a")
-        self.scroll.pack(fill="both", expand=True, padx=28, pady=(0,20))
+        top = ctk.CTkFrame(right, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="nsew", pady=(0, 16))
+        self._panel(top, "priority", title="TOP PRIORITIES", expand=True)
 
-    def _render(self):
-        for w in self.scroll.winfo_children():
+        bot = ctk.CTkFrame(right, fg_color="transparent")
+        bot.grid(row=1, column=0, sticky="nsew")
+        self._panel(bot, "appointment", title="APPOINTMENTS / CALLS", expand=True)
+
+    def _panel(self, parent, category, title, expand):
+        if title:
+            ctk.CTkLabel(parent, text=title,
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=LABEL_GRAY).pack(anchor="w", pady=(0, 2))
+
+        addrow = ctk.CTkFrame(parent, fg_color="transparent")
+        addrow.pack(fill="x", pady=(2, 6))
+        addrow.columnconfigure(0, weight=1)
+        entry = ctk.CTkEntry(addrow, placeholder_text="Add an item",
+                             height=34, fg_color=PAPER, border_color=RULE_LIGHT,
+                             border_width=1, text_color=INK,
+                             font=ctk.CTkFont(size=13))
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        date_e = ctk.CTkEntry(addrow, placeholder_text="Due (opt)",
+                              width=88, height=34, fg_color=PAPER,
+                              border_color=RULE_LIGHT, border_width=1,
+                              text_color=INK, font=ctk.CTkFont(size=12))
+        date_e.grid(row=0, column=1)
+        for w in (entry, date_e):
+            w.bind("<Return>", lambda e, c=category: self._add(c))
+        self.entries[category] = entry
+        self.date_entries[category] = date_e
+
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent",
+                                        scrollbar_button_color="#dfe1e6",
+                                        scrollbar_button_hover_color="#cfd2d8")
+        scroll.pack(fill="both", expand=expand)
+        self.frames[category] = scroll
+
+    # -- Rendering --------------------------------------------------------------
+    def _render_all(self):
+        for cat in CATEGORIES:
+            self._render_panel(cat)
+
+    def _render_panel(self, category):
+        frame = self.frames[category]
+        for w in frame.winfo_children():
             w.destroy()
-        active    = [t for t in self.tasks if not t["done"]]
-        completed = [t for t in self.tasks if t["done"]]
-        active.sort(key=lambda t: due_priority(t.get("due", "")))
-        completed.sort(key=lambda t: (t.get("due", "9999"), t.get("completed_at", "")))
-        self._section_label(f"Active  ({len(active)})")
-        if active:
-            for t in active: self._task_card(t)
-        else:
-            ctk.CTkLabel(self.scroll, text="No active tasks - add one above!",
-                         text_color="#4b5563", font=ctk.CTkFont(size=13)).pack(pady=12)
-        self._section_label(f"Completed  ({len(completed)})")
-        if completed:
-            for t in completed: self._task_card(t)
-        else:
-            ctk.CTkLabel(self.scroll, text="Nothing completed yet",
-                         text_color="#4b5563", font=ctk.CTkFont(size=13)).pack(pady=12)
 
-    def _section_label(self, text):
-        row = ctk.CTkFrame(self.scroll, fg_color="transparent")
-        row.pack(fill="x", pady=(14, 6))
-        ctk.CTkLabel(row, text=text.upper(), font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#6b7280").pack(side="left")
-        ctk.CTkFrame(row, height=1, fg_color="#2a2d3a").pack(side="left", fill="x", expand=True, padx=(10,0), pady=5)
+        items = [t for t in self.tasks if t["category"] == category]
+        items.sort(key=lambda t: (t["done"], due_priority(t.get("due", "")),
+                                  t.get("created", "")))
+        rows = 0
+        for t in items:
+            self._item_row(frame, t)
+            rows += 1 + (len(t.get("subtasks", [])) if t.get("expanded", True) else 0)
 
-    def _task_card(self, task):
-        done=task["done"]; due=task.get("due",""); subtasks=task.get("subtasks",[])
-        expanded=task.get("expanded",True); ac=accent_color(due,done)
-        outer=ctk.CTkFrame(self.scroll,fg_color="transparent"); outer.pack(fill="x",pady=4)
-        card=ctk.CTkFrame(outer,fg_color="#1a1d27",corner_radius=10,border_width=1,border_color="#2a2d3a")
-        card.pack(fill="x")
-        if ac: ctk.CTkFrame(card,width=4,fg_color=ac,corner_radius=2).pack(side="left",fill="y",padx=(0,0))
-        content=ctk.CTkFrame(card,fg_color="transparent"); content.pack(fill="x",expand=True)
-        content.columnconfigure(1,weight=1)
-        name_col="#4b5563" if done else "#e8eaf0"
-        name_btn=ctk.CTkButton(content,text=task["name"],font=ctk.CTkFont(size=14,overstrike=done),
-            text_color=name_col,fg_color="transparent",hover_color="#22253a",anchor="w",corner_radius=6,
-            command=lambda tid=task["id"]: self._toggle_task(tid))
-        name_btn.grid(row=0,column=1,sticky="ew",padx=(14,8),pady=(14,2 if due else 14))
+        for _ in range(max(0, MIN_LINES[category] - rows)):
+            self._empty_line(frame)
+
+    def _item_row(self, parent, task):
+        done = task["done"]
+        due = task.get("due", "")
+        subs = task.get("subtasks", [])
+        expanded = task.get("expanded", True)
+
+        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer.pack(fill="x")
+        row = ctk.CTkFrame(outer, fg_color="transparent")
+        row.pack(fill="x")
+        row.columnconfigure(1, weight=1)
+
+        var = ctk.StringVar(value="on" if done else "off")
+        ctk.CTkCheckBox(
+            row, text="", variable=var, onvalue="on", offvalue="off",
+            width=22, checkbox_width=20, checkbox_height=20, corner_radius=4,
+            border_width=2, border_color=BOX_BORDER, fg_color=CHECK_FILL,
+            hover_color=CHECK_FILL, checkmark_color="#ffffff",
+            command=lambda tid=task["id"]: self._toggle(tid)
+        ).grid(row=0, column=0, sticky="w", padx=(2, 8), pady=7)
+
+        ctk.CTkLabel(row, text=task["name"], anchor="w",
+                     font=item_font(15, overstrike=done),
+                     text_color=DONE_TEXT if done else INK).grid(
+            row=0, column=1, sticky="ew", pady=7)
+
+        col = 2
         if due:
-            due_txt,due_col=fmt_due(due)
-            ctk.CTkLabel(content,text=due_txt,font=ctk.CTkFont(size=11),
-                text_color=due_col if not done else "#4b5563",anchor="w").grid(row=1,column=1,sticky="w",padx=(14,8),pady=(0,12))
-        if subtasks:
-            done_count=sum(1 for s in subtasks if s["done"])
-            badge_col="#4ade80" if done_count==len(subtasks) else "#9ca3af"
-            ctk.CTkLabel(content,text=f"{done_count}/{len(subtasks)}",font=ctk.CTkFont(size=11,weight="bold"),
-                text_color=badge_col).grid(row=0,column=2,padx=(0,4),pady=14)
-        if subtasks:
-            arrow="\u25be" if expanded else "\u25b8"
-            ctk.CTkButton(content,text=arrow,width=28,height=28,fg_color="transparent",hover_color="#2a2d3a",
-                text_color="#9ca3af",font=ctk.CTkFont(size=14),
-                command=lambda tid=task["id"]: self._toggle_expand(tid)).grid(row=0,column=3,padx=(0,4),pady=14)
-        add_sub=ctk.CTkButton(content,text="\u2295",width=28,height=28,fg_color="transparent",hover_color="#1f2a3a",
-            text_color="#4f8ef7",font=ctk.CTkFont(size=16),
-            command=lambda tid=task["id"],ow=outer: self._toggle_subtask_input(tid,ow))
-        add_sub.grid(row=0,column=4,padx=(0,4),pady=14)
-        ctk.CTkButton(content,text="\u2715",width=28,height=28,fg_color="transparent",hover_color="#2a1a1a",
-            text_color="#3a3d4a",font=ctk.CTkFont(size=13),
-            command=lambda tid=task["id"]: self._delete_task(tid)).grid(row=0,column=5,padx=(0,12),pady=14)
-        if subtasks and expanded:
-            sub_frame=ctk.CTkFrame(outer,fg_color="#131620",corner_radius=0,border_width=0)
-            sub_frame.pack(fill="x",padx=(18,0))
-            for sub in subtasks: self._subtask_row(sub_frame,task["id"],sub)
-        if self._subtask_open_id==task["id"]: self._render_subtask_input(outer,task["id"])
+            txt, clr = fmt_due(due)
+            ctk.CTkLabel(row, text=txt, font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=DONE_TEXT if done else clr).grid(
+                row=0, column=col, padx=(6, 2), pady=7)
+            col += 1
 
-    def _subtask_row(self,parent,task_id,sub):
-        row=ctk.CTkFrame(parent,fg_color="transparent"); row.pack(fill="x",padx=(12,12),pady=2)
-        row.columnconfigure(1,weight=1)
-        ctk.CTkFrame(row,width=2,fg_color="#2a2d3a",corner_radius=1).grid(row=0,column=0,sticky="ns",padx=(4,8))
-        sub_done=sub["done"]
-        ctk.CTkButton(row,text=sub["name"],font=ctk.CTkFont(size=13,overstrike=sub_done),
-            text_color="#4b5563" if sub_done else "#b0b8c8",fg_color="transparent",hover_color="#22253a",
-            anchor="w",corner_radius=4,
-            command=lambda sid=sub["id"]: self._toggle_subtask(task_id,sid)).grid(row=0,column=1,sticky="ew",padx=(0,4),pady=5)
-        ctk.CTkButton(row,text="\u2715",width=22,height=22,fg_color="transparent",hover_color="#2a1a1a",
-            text_color="#3a3d4a",font=ctk.CTkFont(size=11),
-            command=lambda sid=sub["id"]: self._delete_subtask(task_id,sid)).grid(row=0,column=2,padx=(4,4),pady=5)
+        if subs:
+            dc = sum(1 for s in subs if s["done"])
+            badge_col = "#16a34a" if dc == len(subs) else LABEL_GRAY
+            ctk.CTkLabel(row, text=f"{dc}/{len(subs)}",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=badge_col).grid(row=0, column=col, padx=(4, 2), pady=7)
+            col += 1
+            arrow = "▾" if expanded else "▸"
+            ctk.CTkButton(row, text=arrow, width=24, height=24,
+                          fg_color="transparent", hover_color=HOVER,
+                          text_color=LABEL_GRAY, font=ctk.CTkFont(size=13),
+                          command=lambda tid=task["id"]: self._toggle_expand(tid)).grid(
+                row=0, column=col, padx=(0, 2), pady=7)
+            col += 1
 
-    def _render_subtask_input(self,parent,task_id):
-        inp_frame=ctk.CTkFrame(parent,fg_color="#1a1d27",corner_radius=0,border_width=1,border_color="#2a2d3a")
-        inp_frame.pack(fill="x",padx=(18,0))
-        inner=ctk.CTkFrame(inp_frame,fg_color="transparent"); inner.pack(fill="x",padx=12,pady=8)
-        inner.columnconfigure(0,weight=1)
-        ctk.CTkFrame(inner,width=2,fg_color="#4f8ef7",corner_radius=1).grid(row=0,column=0,sticky="ns",padx=(4,8))
-        entry=ctk.CTkEntry(inner,placeholder_text="Subtask name...",fg_color="#0f1117",
-            border_color="#2a2d3a",text_color="#e8eaf0",height=32,width=340)
-        entry.grid(row=0,column=1,padx=(0,8)); entry.focus()
-        def commit(e=None):
-            name=entry.get().strip()
-            if name: self._add_subtask(task_id,name)
-            else: self._subtask_open_id=None; self._render()
-        def cancel(e=None): self._subtask_open_id=None; self._render()
-        entry.bind("<Return>",commit); entry.bind("<Escape>",cancel)
-        ctk.CTkButton(inner,text="Add",width=60,height=32,fg_color="#4f8ef7",hover_color="#3d7de8",
-            font=ctk.CTkFont(size=12,weight="bold"),command=commit).grid(row=0,column=2,padx=(0,4))
-        ctk.CTkButton(inner,text="\u2715",width=32,height=32,fg_color="transparent",hover_color="#2a1a1a",
-            text_color="#6b7280",font=ctk.CTkFont(size=13),command=cancel).grid(row=0,column=3)
+        ctk.CTkButton(row, text="+", width=24, height=24,
+                      fg_color="transparent", hover_color=HOVER,
+                      text_color=ACCENT, font=ctk.CTkFont(size=16, weight="bold"),
+                      command=lambda tid=task["id"]: self._toggle_subtask_input(tid)).grid(
+            row=0, column=col, padx=(0, 2), pady=7)
+        col += 1
+        ctk.CTkButton(row, text="✕", width=24, height=24,
+                      fg_color="transparent", hover_color=HOVER,
+                      text_color=DELETE_GRAY, font=ctk.CTkFont(size=12),
+                      command=lambda tid=task["id"]: self._delete(tid)).grid(
+            row=0, column=col, padx=(0, 2), pady=7)
 
-    def _add_task(self):
-        name=self.task_entry.get().strip(); due=self.date_entry.get().strip()
-        if not name: self.task_entry.focus(); return
-        if due:
-            try: date.fromisoformat(due)
-            except ValueError:
-                self.date_entry.delete(0,"end"); self.date_entry.insert(0,"Invalid date!"); return
-        self.tasks.append({"id":str(uuid.uuid4()),"name":name,"due":due,"done":False,
-            "completed_at":None,"subtasks":[],"expanded":True})
-        self.task_entry.delete(0,"end"); self.date_entry.delete(0,"end")
-        self.date_entry.insert(0,today_str()); save_tasks(self.tasks); self._render(); self.task_entry.focus()
+        if subs and expanded:
+            for s in subs:
+                self._subtask_row(outer, task["id"], s)
+        if self._subtask_open_id == task["id"]:
+            self._render_subtask_input(outer, task["id"])
 
-    def _toggle_task(self,tid):
+        ctk.CTkFrame(parent, height=1, fg_color=RULE_LIGHT).pack(fill="x")
+
+    def _subtask_row(self, parent, task_id, sub):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=(28, 0))
+        row.columnconfigure(1, weight=1)
+        ctk.CTkFrame(row, width=2, fg_color=RULE_LIGHT).grid(
+            row=0, column=0, sticky="ns", padx=(2, 8), pady=2)
+        sd = sub["done"]
+        var = ctk.StringVar(value="on" if sd else "off")
+        ctk.CTkCheckBox(
+            row, text="", variable=var, onvalue="on", offvalue="off",
+            width=20, checkbox_width=16, checkbox_height=16, corner_radius=3,
+            border_width=2, border_color=BOX_BORDER, fg_color=CHECK_FILL,
+            hover_color=CHECK_FILL, checkmark_color="#ffffff",
+            command=lambda sid=sub["id"]: self._toggle_subtask(task_id, sid)
+        ).grid(row=0, column=1, sticky="w", padx=(0, 6), pady=3)
+        ctk.CTkLabel(row, text=sub["name"], anchor="w",
+                     font=item_font(13, overstrike=sd),
+                     text_color=DONE_TEXT if sd else SUB_TEXT).grid(
+            row=0, column=2, sticky="ew", pady=3)
+        ctk.CTkButton(row, text="✕", width=22, height=22,
+                      fg_color="transparent", hover_color=HOVER,
+                      text_color=DELETE_GRAY, font=ctk.CTkFont(size=11),
+                      command=lambda sid=sub["id"]: self._delete_subtask(task_id, sid)).grid(
+            row=0, column=3, padx=(4, 2), pady=3)
+
+    def _render_subtask_input(self, parent, task_id):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="x", padx=(28, 0))
+        frame.columnconfigure(1, weight=1)
+        ctk.CTkFrame(frame, width=2, fg_color=ACCENT).grid(
+            row=0, column=0, sticky="ns", padx=(2, 8), pady=2)
+        entry = ctk.CTkEntry(frame, placeholder_text="Subtask name…",
+                             height=30, fg_color=PAPER, border_color=RULE_LIGHT,
+                             border_width=1, text_color=INK, font=ctk.CTkFont(size=12))
+        entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=2)
+        entry.focus()
+
+        def commit(_=None):
+            name = entry.get().strip()
+            if name:
+                self._add_subtask(task_id, name)
+            else:
+                self._subtask_open_id = None
+                self._render_all()
+
+        def cancel(_=None):
+            self._subtask_open_id = None
+            self._render_all()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<Escape>", cancel)
+        ctk.CTkButton(frame, text="Add", width=52, height=30, fg_color=ACCENT,
+                      hover_color="#1d4ed8", font=ctk.CTkFont(size=12, weight="bold"),
+                      command=commit).grid(row=0, column=2, padx=(0, 2), pady=2)
+
+    def _empty_line(self, parent):
+        row = ctk.CTkFrame(parent, fg_color="transparent", height=36)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        box = ctk.CTkFrame(row, width=20, height=20, fg_color=PAPER,
+                           border_width=2, border_color="#dadde2", corner_radius=4)
+        box.pack(side="left", padx=(2, 8), pady=8)
+        box.pack_propagate(False)
+        ctk.CTkFrame(parent, height=1, fg_color=RULE_LIGHT).pack(fill="x")
+
+    # -- Actions ----------------------------------------------------------------
+    def _add(self, category):
+        entry = self.entries[category]
+        date_e = self.date_entries[category]
+        name = entry.get().strip()
+        if not name:
+            entry.focus()
+            return
+        due = parse_due(date_e.get())
+        if due is None:
+            date_e.delete(0, "end")
+            date_e.configure(placeholder_text="bad date")
+            return
+        self.tasks.append({
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "category": category,
+            "due": due,
+            "done": False,
+            "created": datetime.now().isoformat(),
+            "completed_at": None,
+            "subtasks": [],
+            "expanded": True,
+        })
+        entry.delete(0, "end")
+        date_e.delete(0, "end")
+        save_tasks(self.tasks)
+        self._render_panel(category)
+        entry.focus()
+
+    def _toggle(self, tid):
+        cat = None
         for t in self.tasks:
-            if t["id"]==tid:
-                t["done"]=not t["done"]
-                t["completed_at"]=datetime.now().isoformat() if t["done"] else None; break
-        save_tasks(self.tasks); self._render()
-
-    def _delete_task(self,tid):
-        self.tasks=[t for t in self.tasks if t["id"]!=tid]
-        if self._subtask_open_id==tid: self._subtask_open_id=None
-        save_tasks(self.tasks); self._render()
-
-    def _toggle_expand(self,tid):
-        for t in self.tasks:
-            if t["id"]==tid: t["expanded"]=not t.get("expanded",True); break
-        save_tasks(self.tasks); self._render()
-
-    def _toggle_subtask_input(self,tid,_outer):
-        if self._subtask_open_id==tid: self._subtask_open_id=None
-        else:
-            self._subtask_open_id=tid
-            for t in self.tasks:
-                if t["id"]==tid: t["expanded"]=True; break
-        self._render()
-
-    def _add_subtask(self,task_id,name):
-        for t in self.tasks:
-            if t["id"]==task_id:
-                t.setdefault("subtasks",[]).append({"id":str(uuid.uuid4()),"name":name,"done":False})
-                t["expanded"]=True; break
-        self._subtask_open_id=task_id; save_tasks(self.tasks); self._render()
-
-    def _toggle_subtask(self,task_id,sub_id):
-        for t in self.tasks:
-            if t["id"]==task_id:
-                for s in t.get("subtasks",[]):
-                    if s["id"]==sub_id: s["done"]=not s["done"]; break
+            if t["id"] == tid:
+                t["done"] = not t["done"]
+                t["completed_at"] = datetime.now().isoformat() if t["done"] else None
+                cat = t["category"]
                 break
-        save_tasks(self.tasks); self._render()
+        save_tasks(self.tasks)
+        if cat:
+            self._render_panel(cat)
 
-    def _delete_subtask(self,task_id,sub_id):
+    def _delete(self, tid):
+        cat = next((t["category"] for t in self.tasks if t["id"] == tid), None)
+        self.tasks = [t for t in self.tasks if t["id"] != tid]
+        if self._subtask_open_id == tid:
+            self._subtask_open_id = None
+        save_tasks(self.tasks)
+        if cat:
+            self._render_panel(cat)
+
+    def _toggle_expand(self, tid):
         for t in self.tasks:
-            if t["id"]==task_id:
-                t["subtasks"]=[s for s in t.get("subtasks",[]) if s["id"]!=sub_id]; break
-        save_tasks(self.tasks); self._render()
+            if t["id"] == tid:
+                t["expanded"] = not t.get("expanded", True)
+                self._render_panel(t["category"])
+                break
+
+    def _toggle_subtask_input(self, tid):
+        if self._subtask_open_id == tid:
+            self._subtask_open_id = None
+        else:
+            self._subtask_open_id = tid
+            for t in self.tasks:
+                if t["id"] == tid:
+                    t["expanded"] = True
+                    break
+        self._render_all()
+
+    def _add_subtask(self, task_id, name):
+        for t in self.tasks:
+            if t["id"] == task_id:
+                t.setdefault("subtasks", []).append(
+                    {"id": str(uuid.uuid4()), "name": name, "done": False})
+                t["expanded"] = True
+                break
+        self._subtask_open_id = task_id
+        save_tasks(self.tasks)
+        self._render_all()
+
+    def _toggle_subtask(self, task_id, sub_id):
+        for t in self.tasks:
+            if t["id"] == task_id:
+                for s in t.get("subtasks", []):
+                    if s["id"] == sub_id:
+                        s["done"] = not s["done"]
+                        break
+                self._render_panel(t["category"])
+                break
+        save_tasks(self.tasks)
+
+    def _delete_subtask(self, task_id, sub_id):
+        for t in self.tasks:
+            if t["id"] == task_id:
+                t["subtasks"] = [s for s in t.get("subtasks", []) if s["id"] != sub_id]
+                self._render_panel(t["category"])
+                break
+        save_tasks(self.tasks)
 
 
 # -- Entry point ----------------------------------------------------------------
